@@ -317,6 +317,22 @@ print(r.choices[0].message.content)
   Without a setting the model uses its own default, **high**. `none` answers at once (fastest); `low` keeps the thinking
   short. The levels are instructions the model was trained with, not a hard token limit: on easy questions all three
   think briefly, on hard ones `high` thinks longest and is most accurate.
+- **A cap on thinking tokens.** Because thinking and the answer share `max_tokens`, a run that thinks past the cap can
+  end with reasoning only and no answer at all - the model has to close its own thinking, and on a hard question it
+  sometimes does not. A thinking budget makes that impossible: at the budget the server stops the model, adds a short
+  wrap-up and `</think>` in its place and lets it answer from there. Nothing is re-read: the prompt it already wrote is
+  still in the cache, so the second read is a hit and the answer costs only its own tokens.
+
+  | API | how |
+  | --- | --- |
+  | OpenAI | `"reasoning_budget_tokens": N`, and optionally `"reasoning_budget_message": "..."` (llama.cpp's names) |
+  | Anthropic | `"thinking": {"type": "enabled", "budget_tokens": N}` - now a limit, not just a level |
+  | Every client | the chat page's "Use for other apps too" with a thinking budget, then `POST /settings {"defaults": {"reasoning_budget_tokens": N}}` |
+
+  `N` counts thinking tokens; `0` ends the thinking at once, and a negative or absent value means no cap at all
+  (the behaviour without a budget). The budget is a cap, not a target: a question that answers without it never
+  reaches it. Set it together with `max_tokens`, which still bounds the whole completion - thinking, wrap-up and
+  answer.
 - **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
   (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
   long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every

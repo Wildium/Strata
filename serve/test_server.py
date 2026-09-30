@@ -16,7 +16,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, MockEngine, Service, StrataEngine, request_timings, serve  # noqa: E402
+from serve.server import (CTX_SLACK, BUDGET_MESSAGE, ByteTokenizer, EngineDied, MockEngine, Service,  # noqa: E402
+                          StrataEngine, request_timings, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -812,6 +813,141 @@ class TimingsDrafts(unittest.TestCase):
         self.assertEqual((t["prompt_n"], t["cache_n"]), (20, 4))
         self.assertNotIn("draft_n", request_timings(24, 20, base))
         self.assertIsNone(request_timings(24, 20, {}))
+
+class ThinkingBudget(unittest.TestCase):
+    """A cap on thinking tokens (issue #123).  Thinking and the answer share max_tokens, so a run that thinks
+    past a small cap ends with reasoning only and the client sees no answer at all.  At the budget the engine
+    is stopped, the wrap-up plus </think> is injected into the prompt and generation continues from it (the
+    prefix is reused, so the second read is a cache hit)."""
+
+    THINKING = "t" * 200                     # longer than any budget used here, and never closed
+    ANSWER = "the answer"
+
+    def make(self, scripts, **svc_kw):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, scripts, max_context=CTX)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), **svc_kw)
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        return engine, svc
+
+    def post(self, path, body, raw=False):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json",
+                                              "anthropic-version": "2023-06-01"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, (r.read().decode() if raw else json.loads(r.read()))
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def openai(self, _raw=False, **kw):
+        return self.post("/v1/chat/completions",
+                         {"model": "m", "messages": [{"role": "user", "content": "hi"}], **kw}, raw=_raw)
+
+    def test_budget_closes_the_thinking_and_answers(self):
+        engine, svc = self.make([self.THINKING, self.ANSWER])
+        s, b = self.openai(max_tokens=1000, reasoning_budget_tokens=20)
+        self.assertEqual(s, 200, b)
+        c = b["choices"][0]
+        self.assertEqual(c["finish_reason"], "stop")
+        self.assertEqual(c["message"]["content"], self.ANSWER)
+        self.assertEqual(c["message"]["reasoning_content"], "t" * 20)     # stopped exactly at the budget
+        self.assertEqual(engine.turns, 2)                                # one run to think, one to answer
+        injected = ByteTokenizer().decode(engine.last_prompt)
+        self.assertTrue(injected.startswith("t" * 20) or "t" * 20 in injected)
+        self.assertIn(BUDGET_MESSAGE, injected)
+        self.assertIn("</think>", injected)
+        self.assertEqual(b["usage"]["completion_tokens"], 20 + len(self.ANSWER) + 1)   # + the end-of-turn token
+        self.assertTrue(svc.history[-1]["thinking_cut"])
+
+    def test_message_can_be_given(self):
+        engine, svc = self.make([self.THINKING, self.ANSWER])
+        self.openai(max_tokens=1000, reasoning_budget_tokens=5, reasoning_budget_message="wrap it up")
+        injected = ByteTokenizer().decode(engine.last_prompt)
+        self.assertIn("wrap it up", injected)
+        self.assertNotIn(BUDGET_MESSAGE, injected)
+
+    def test_zero_budget_ends_the_thinking_at_once(self):
+        """llama.cpp's meaning for 0: immediate end of thinking."""
+        engine, svc = self.make([self.THINKING, self.ANSWER])
+        s, b = self.openai(max_tokens=1000, reasoning_budget_tokens=0)
+        self.assertEqual(engine.turns, 2)
+        self.assertEqual(b["choices"][0]["message"]["content"], self.ANSWER)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], "t")
+
+    def test_a_negative_budget_is_unbounded(self):
+        engine, svc = self.make(["t" * 30 + "</think>\n\n" + self.ANSWER, self.ANSWER])
+        s, b = self.openai(max_tokens=1000, reasoning_budget_tokens=-1)
+        self.assertEqual(engine.turns, 1)
+        self.assertEqual(b["choices"][0]["message"]["content"], self.ANSWER)
+
+    def test_no_budget_is_unchanged(self):
+        engine, svc = self.make(["</think>\n\n" + self.ANSWER, self.ANSWER])
+        s, b = self.openai(max_tokens=1000)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(b["choices"][0]["message"]["content"], self.ANSWER)
+        self.assertEqual(engine.turns, 1)
+        self.assertFalse(svc.history[-1]["thinking_cut"])
+
+    def test_a_budget_above_the_thinking_is_unused(self):
+        engine, svc = self.make(["</think>\n\n" + self.ANSWER, "unused"])
+        s, b = self.openai(max_tokens=1000, reasoning_budget_tokens=500)
+        self.assertEqual(engine.turns, 1)
+        self.assertEqual(b["choices"][0]["message"]["content"], self.ANSWER)
+        self.assertFalse(svc.history[-1]["thinking_cut"])
+
+    def test_no_room_to_answer_ends_as_length(self):
+        """The budget is spent and the context has nothing left: the turn ends as it would have without one."""
+        engine, svc = self.make([self.THINKING, self.ANSWER])
+        s, b = self.openai(max_tokens=30, reasoning_budget_tokens=30)
+        self.assertEqual(engine.turns, 1)
+        self.assertEqual(b["choices"][0]["finish_reason"], "length")
+        self.assertIsNone(b["choices"][0]["message"]["content"])
+
+    def test_anthropic_thinking_budget(self):
+        engine, svc = self.make([self.THINKING, self.ANSWER])
+        s, b = self.post("/v1/messages", {"model": "m", "max_tokens": 1000,
+                                          "thinking": {"type": "enabled", "budget_tokens": 12},
+                                          "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(s, 200, b)
+        self.assertEqual(engine.turns, 2)
+        self.assertIn(BUDGET_MESSAGE, ByteTokenizer().decode(engine.last_prompt))
+        self.assertIn(self.ANSWER, json.dumps(b))
+
+    def test_shared_default_budget(self):
+        engine, svc = self.make([self.THINKING, self.ANSWER, self.THINKING, self.ANSWER])
+        svc.set_shared({"reasoning_budget_tokens": 8})
+        try:
+            s, b = self.openai(max_tokens=1000)
+            self.assertEqual(len(b["choices"][0]["message"]["reasoning_content"]), 8)
+            self.assertEqual(engine.turns, 2)
+            # an explicit request value wins over the shared default
+            s, b = self.openai(max_tokens=1000, reasoning_budget_tokens=15)
+            self.assertEqual(len(b["choices"][0]["message"]["reasoning_content"]), 15)
+        finally:
+            svc.set_shared(None)
+
+    def test_shared_rejects_a_non_positive_budget(self):
+        engine, svc = self.make([self.ANSWER])
+        s, b = self.post("/settings", {"defaults": {"reasoning_budget_tokens": 0}})
+        self.assertEqual(s, 400)
+
+    def test_streaming_across_the_cut(self):
+        """One continuous SSE response: the thinking, then the answer, then the finish reason."""
+        engine, svc = self.make([self.THINKING, self.ANSWER])
+        s, body = self.openai(max_tokens=1000, reasoning_budget_tokens=6, stream=True, _raw=True)
+        self.assertEqual(s, 200)
+        chunks = [json.loads(line[len("data: "):]) for line in body.splitlines() if line.startswith("data: {")]
+        delta = lambda c, k: c["choices"][0]["delta"].get(k) or ""       # noqa: E731
+        self.assertEqual("".join(delta(c, "reasoning_content") for c in chunks), "t" * 6)
+        self.assertEqual("".join(delta(c, "content") for c in chunks), self.ANSWER)
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(engine.turns, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

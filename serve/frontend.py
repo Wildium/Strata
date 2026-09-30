@@ -470,6 +470,21 @@ class OutputParser:
                 self._reset_scan()
                 self.state, self.lead = "content", True
 
+    def close_thinking(self) -> list[Event]:
+        """End the reasoning phase WITHOUT the end-of-thinking tag, as if the tag had arrived.
+
+        Used by a thinking budget (serve/server.py): generation is stopped mid-think and the wrap-up plus
+        `</think>` is injected into the prompt, so the model's next deltas are the answer - the parser must
+        switch to content exactly as it would have on reading the tag.  Whatever it held back (a partial
+        tag) is reasoning and is returned to be streamed."""
+        out: list[Event] = []
+        if self.state == "reasoning":
+            if self.buf:
+                out.append(Event("reasoning", self.buf))
+            self.buf = ""
+            self.state, self.lead = "content", True
+        return out
+
     def finish(self) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content)."""
         out = []

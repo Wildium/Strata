@@ -50,6 +50,14 @@ from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+# A thinking-token budget (issue #123).  Thinking and the answer share max_tokens, so a run that thinks past
+# a small cap ends with reasoning only and the client sees no answer at all - the model would have to close its
+# own thinking, and sometimes it does not.  `reasoning_budget_tokens` (llama.cpp's name) caps the thinking:
+# at the budget the engine is stopped, the wrap-up and `</think>` are injected into the prompt and generation
+# continues from there.  The prefix is reused, so the second read is a cache hit and costs almost nothing.
+BUDGET_MESSAGE = ("Considering the limited time by the user, I have to give the solution based on the "
+                  "thinking directly now.")
+THINK_END_TAG = "</think>"
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -589,13 +597,19 @@ class Service:
         return self.shared
 
     def with_shared(self, req: dict, api: str) -> dict:
-        """The request with the shared thinking level and max tokens filled in where it has none of its own."""
+        """The request with the shared thinking level, thinking budget and max tokens filled in where it has none
+        of its own."""
         s = self.shared
         if not s:
             return req
         req = dict(req)
         if "max_tokens" in s and not req.get("max_tokens") and not req.get("max_completion_tokens"):
             req["max_tokens"] = s["max_tokens"]
+        if "reasoning_budget_tokens" in s and not req.get("reasoning_budget_tokens"):
+            # Anthropic clients ask with "thinking": {"budget_tokens": N} - that is their budget already
+            thinking = req.get("thinking")
+            if not (isinstance(thinking, dict) and thinking.get("budget_tokens")):
+                req["reasoning_budget_tokens"] = s["reasoning_budget_tokens"]
         effort = s.get("reasoning_effort")
         if effort:
             if api == "openai":
@@ -798,6 +812,9 @@ class Service:
             sampling = {**defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        budget, budget_msg = thinking_budget(sampling or {})
+        ids_used = ids                                 # the prompt of the last engine run (the budget appends to it)
+        cut = False                                     # this request's thinking was stopped by the budget
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
@@ -823,43 +840,45 @@ class Service:
                     self.last_request_at = time.time()
                     self.rate.clear()               # the previous request's samples must not leak into this one
                 before = getattr(self.engine, "last", None)
-                last_print = time.time()
-                gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
-                    self.engine.generate(ids, max_new, sampling, cancel)
-                try:
-                    for t in gen:
-                        if t is None:                   # heartbeat while the engine is quiet
-                            last_print = self._progress(last_print)
-                            yield "ping", None
-                            continue
-                        n += 1
-                        if t in self.stop_ids:
-                            finish = "stop"
-                            raw_ids.append(t)
-                            break
-                        raw_ids.append(t)
-                        evs = parser.feed(detok.push(t))
-                        self._note(n, evs)
-                        last_print = self._progress(last_print)
-                        for ev in evs:
-                            yield "event", ev
-                    if cancel.is_set():
-                        finish = "cancel"
-                except EngineDied as e:
+                count = [0]                     # tokens generated so far, shared with _generate: an engine that
+                try:                            # dies mid-answer still leaves its count for the row below
+                    finish, raw_ids = yield from self._generate(ids, max_new, sampling, cancel, parser, count,
+                                                                budget, emb)
+                except (EngineDied, ValueError):
                     finish = "error"
-                    note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
-                    print(f"[strata] {e}. {note} The next request starts the engine again."
-                          f"{' Its log: ' + self.engine.log_path if getattr(self.engine, 'log_path', None) else ''}",
-                          flush=True)
-                    raise
-                except ValueError as e:                 # the engine's ERR line (it may have ended after it)
-                    finish = "error"
-                    print(f"[strata] the engine reported an error: {e}", flush=True)
                     raise
                 finally:
-                    gen.close()                         # STOP+drain to THIS request's DONE while still holding the
-                    #                                     fifo, so a stop-token break can't leave the shared engine
-                    #                                     queue mid-drain for the next request to read as its own DONE
+                    n = count[0]
+                if finish == "budget":
+                    # The thinking budget is spent (issue #123): close the thinking for the model and let it
+                    # answer.  The prompt becomes everything it wrote plus the wrap-up and </think>, so the
+                    # second read is a cache hit on the prefix already in VRAM - the owner's design on #123.
+                    cut = True
+                    for ev in parser.close_thinking():
+                        yield "event", ev
+                    close_ids = self.tok.encode("\n\n" + budget_msg + "\n\n" + THINK_END_TAG + "\n\n", parse_special=True)
+                    answer_ids = list(ids) + raw_ids + close_ids
+                    room = min(max_new - n, self.engine.max_context - CTX_SLACK - len(answer_ids))
+                    if room < 1:
+                        finish = "length"           # no room left to answer in: the turn ends as it would have
+                        print(f"[strata] thinking budget {budget} reached after {n} tokens, but the context "
+                              f"leaves no room to answer in", flush=True)
+                    else:
+                        print(f"[strata] thinking budget {budget} reached after {n} tokens: closing the thinking "
+                              f"and answering ({len(close_ids)} tokens injected, prefix reused)", flush=True)
+                        with self.status_lock:
+                            self.status.update(phase="answering", max_tokens=n + room)
+                        ids_used = answer_ids
+                        more = []
+                        try:
+                            finish, more = yield from self._generate(answer_ids, room, sampling, cancel, parser,
+                                                                     count, None, emb)
+                        except (EngineDied, ValueError):
+                            finish = "error"
+                            raise
+                        finally:
+                            n = count[0]
+                        raw_ids += more
         except GeneratorExit:                           # the client disconnected mid-stream
             finish = "disconnect"
             raise
@@ -879,6 +898,7 @@ class Service:
                         if loaded else None,
                         "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
                         "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
+                        "thinking_cut": cut,
                         "engine_generated": last.get("generated"),
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
@@ -893,7 +913,7 @@ class Service:
                     t["decode_ms"] += last.get("decode_ms") or 0.0
                     fresh = getattr(self.engine, "last", None)
                     if fresh is not None and fresh is not before:      # the engine's clock for THIS request
-                        timings = request_timings(len(ids), n, last)
+                        timings = request_timings(len(ids_used), n, last)
                         self.last_timings = dict(timings, at=int(time.time())) if timings else None
                     self.last_request_at = time.time()
                     now = time.time()
@@ -910,6 +930,82 @@ class Service:
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings}
+
+    def _generate(self, ids, max_new, sampling, cancel, parser, count, budget, emb):
+        """One `engine.generate` run, parsed into events.
+
+        Yields ("ping", None) while the engine is quiet and ("event", Event) as text arrives; returns (finish,
+        the ids generated by THIS run).  `count` is a one-element list holding the tokens generated so far,
+        updated in place - it survives an engine death mid-answer, which the caller's request row needs.
+
+        When `budget` (thinking tokens) is reached the run stops early with finish "budget": the caller injects
+        the wrap-up and continues.  Stops the engine on the way out (STOP, drained to this run's DONE while the
+        fifo is still held), so a second run in the same request starts from a quiet engine."""
+        detok, finish, raw_ids, thought = Detokenizer(self.tok), "length", [], 0
+        last_print = time.time()
+        gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
+            self.engine.generate(ids, max_new, sampling, cancel)
+        try:
+            for t in gen:
+                if t is None:                   # heartbeat while the engine is quiet
+                    last_print = self._progress(last_print)
+                    yield "ping", None
+                    continue
+                count[0] += 1
+                if t in self.stop_ids:
+                    finish = "stop"
+                    raw_ids.append(t)
+                    break
+                raw_ids.append(t)
+                evs = parser.feed(detok.push(t))
+                if parser.state == "reasoning":  # still inside the thinking block: this token is thinking
+                    thought += 1
+                self._note(count[0], evs)
+                last_print = self._progress(last_print)
+                for ev in evs:
+                    yield "event", ev
+                if budget is not None and parser.state == "reasoning" and thought >= budget:
+                    finish = "budget"
+                    break
+            if cancel.is_set():
+                finish = "cancel"
+        except EngineDied as e:
+            note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
+            print(f"[strata] {e}. {note} The next request starts the engine again."
+                  f"{' Its log: ' + self.engine.log_path if getattr(self.engine, 'log_path', None) else ''}",
+                  flush=True)
+            raise
+        except ValueError as e:                 # the engine's ERR line (it may have ended after it)
+            print(f"[strata] the engine reported an error: {e}", flush=True)
+            raise
+        finally:
+            gen.close()                         # STOP+drain to THIS run's DONE while still holding the fifo, so
+            #                                     a stop-token break can't leave the shared engine queue mid-drain
+            #                                     for the next request to read as its own DONE
+        return finish, raw_ids
+
+
+def thinking_budget(req: dict) -> tuple[int | None, str]:
+    """A request's thinking-token budget and the wrap-up to inject when it is reached.
+
+    `reasoning_budget_tokens` (llama.cpp's name and meaning) or Anthropic's `thinking.budget_tokens`; absent,
+    null or negative means unbounded, which is the behaviour with no budget at all.  The wrap-up can be given
+    with `reasoning_budget_message` (llama.cpp's name); the default is BUDGET_MESSAGE."""
+    value = req.get("reasoning_budget_tokens")
+    if value is None or value == "":
+        thinking = req.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") != "disabled":
+            value = thinking.get("budget_tokens")
+    if isinstance(value, bool):                 # a flag, not a budget
+        return None, ""
+    try:
+        tokens = int(value)
+    except (TypeError, ValueError):
+        return None, ""
+    if tokens < 0:
+        return None, ""
+    message = req.get("reasoning_budget_message")
+    return tokens, (message.strip() if isinstance(message, str) and message.strip() else BUDGET_MESSAGE)
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
@@ -1540,7 +1636,8 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     return httpd
 
 
-SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection")
+SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
+               "experimental_speed_projection")
 
 
 def clean_shared_defaults(d) -> dict:
@@ -1567,7 +1664,7 @@ def clean_shared_defaults(d) -> dict:
             if not number or value != int(value) or not 1 <= value <= 64:
                 raise ValueError("top_k: an integer 1..64")
             value = int(value)
-        elif key in ("seed", "max_tokens"):
+        elif key in ("seed", "max_tokens", "reasoning_budget_tokens"):
             if not number or value != int(value) or value <= 0:
                 raise ValueError(f"{key}: a positive integer")
             value = int(value)
