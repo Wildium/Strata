@@ -327,6 +327,7 @@ print(r.choices[0].message.content)
   | --- | --- |
   | OpenAI | `"reasoning_budget_tokens": N`, and optionally `"reasoning_budget_message": "..."` (llama.cpp's names) |
   | Anthropic | `"thinking": {"type": "enabled", "budget_tokens": N}` - now a limit, not just a level |
+  | The server | `--reasoning-budget N` (also `"reasoning_budget_tokens"` in the config, or `$STRATA_REASONING_BUDGET`), with `--reasoning-budget-message` / `"reasoning_budget_message"` / `$STRATA_REASONING_BUDGET_MESSAGE` for the wrap-up. Every client that asks for no budget of its own gets this one - which is how you cap an agent whose own settings you cannot reach |
   | Every client | the chat page's "Use for other apps too" with a thinking budget, then `POST /settings {"defaults": {"reasoning_budget_tokens": N}}` |
 
   `N` counts thinking tokens; `0` ends the thinking at once, and a negative or absent value means no cap at all

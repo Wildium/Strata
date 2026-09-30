@@ -564,6 +564,9 @@ class Service:
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+        self.budget_default: tuple[int | None, str] = (None, "")   # the server's own thinking budget
+        #                                               (--reasoning-budget), for clients that ask for none of
+        #                                               their own (issue #123)
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
@@ -813,6 +816,8 @@ class Service:
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         budget, budget_msg = thinking_budget(sampling or {})
+        if budget is None:                              # the server's own default, when the client asked for none
+            budget, budget_msg = self.budget_default
         ids_used = ids                                 # the prompt of the last engine run (the budget appends to it)
         cut = False                                     # this request's thinking was stopped by the budget
         timings, before = None, None                    # this request's timings; the engine's `last` before it
@@ -1006,6 +1011,39 @@ def thinking_budget(req: dict) -> tuple[int | None, str]:
         return None, ""
     message = req.get("reasoning_budget_message")
     return tokens, (message.strip() if isinstance(message, str) and message.strip() else BUDGET_MESSAGE)
+
+
+def _env_int(name: str) -> int | None:
+    """An integer environment variable, or None.  A typo is named and ignored, not a crash at start."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[strata] ${name}={raw!r} is not a whole number, ignored", flush=True)
+        return None
+
+
+def budget_from_args_and_config(a, cfg: dict) -> tuple[int | None, str]:
+    """The server's own thinking budget: what every client gets when it asks for none of its own.
+
+    `--reasoning-budget N` (llama.cpp's flag, also `"reasoning_budget_tokens"` in the config, and the flag's
+    own default is $STRATA_REASONING_BUDGET so a container can set it with no config file), and
+    `--reasoning-budget-message` / `"reasoning_budget_message"` / $STRATA_REASONING_BUDGET_MESSAGE for the
+    wrap-up.  None or negative means no cap - the behaviour without a budget at all."""
+    raw = a.reasoning_budget if a.reasoning_budget is not None else cfg.get("reasoning_budget_tokens")
+    if raw is None or raw == "":
+        return None, ""
+    try:
+        tokens = int(raw)
+    except (TypeError, ValueError):
+        raise SystemExit(f"[strata] reasoning budget {raw!r}: expected a whole number of tokens "
+                         f"(0 ends the thinking at once, negative = no cap)")
+    if tokens < 0:
+        return None, ""
+    message = (a.reasoning_budget_message or cfg.get("reasoning_budget_message") or "").strip()
+    return tokens, message or BUDGET_MESSAGE
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
@@ -1757,6 +1795,15 @@ def main() -> int:
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY")
+    ap.add_argument("--reasoning-budget", type=int, default=_env_int("STRATA_REASONING_BUDGET"),
+                    help="cap the model's thinking at N tokens: at the budget the server closes the thinking for it "
+                         "and it answers instead of running into max_tokens with nothing to show (llama.cpp's "
+                         "--reasoning-budget; also \"reasoning_budget_tokens\" in the config, or "
+                         "$STRATA_REASONING_BUDGET). 0 ends the thinking at once, absent or negative = no cap")
+    ap.add_argument("--reasoning-budget-message", default=os.environ.get("STRATA_REASONING_BUDGET_MESSAGE", ""),
+                    help="what the model is told in place of the thinking it did not finish (llama.cpp's "
+                         "--reasoning-budget-message; also \"reasoning_budget_message\" in the config, or "
+                         "$STRATA_REASONING_BUDGET_MESSAGE)")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
@@ -1814,6 +1861,10 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
+    svc.budget_default = budget_from_args_and_config(a, cfg)   # every client that asks for no budget of its own
+    if svc.budget_default[0] is not None:
+        print(f"[strata] thinking budget: {svc.budget_default[0]} tokens (a client that asks for its own is "
+              f"unaffected; wrap-up {svc.budget_default[1]!r})", flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     if a.config:                                        # the Chat settings shared with other apps, from last time

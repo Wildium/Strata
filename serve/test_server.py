@@ -13,11 +13,12 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import (CTX_SLACK, BUDGET_MESSAGE, ByteTokenizer, EngineDied, MockEngine, Service,  # noqa: E402
-                          StrataEngine, request_timings, serve)
+                          StrataEngine, _env_int, budget_from_args_and_config, request_timings, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -936,6 +937,23 @@ class ThinkingBudget(unittest.TestCase):
         s, b = self.post("/settings", {"defaults": {"reasoning_budget_tokens": 0}})
         self.assertEqual(s, 400)
 
+    def test_server_default_and_precedence(self):
+        """`--reasoning-budget` (server default): a client that asks for no budget of its own gets it, an explicit
+        request beats it, and the shared Chat settings beat it too."""
+        engine, svc = self.make([self.THINKING, self.ANSWER, self.THINKING, self.ANSWER, self.THINKING, self.ANSWER])
+        svc.budget_default = (7, BUDGET_MESSAGE)
+        s, b = self.openai(max_tokens=1000)
+        self.assertEqual(len(b["choices"][0]["message"]["reasoning_content"]), 7)
+        self.assertEqual(engine.turns, 2)
+        s, b = self.openai(max_tokens=1000, reasoning_budget_tokens=12)
+        self.assertEqual(len(b["choices"][0]["message"]["reasoning_content"]), 12)
+        svc.set_shared({"reasoning_budget_tokens": 9})
+        try:
+            s, b = self.openai(max_tokens=1000)
+            self.assertEqual(len(b["choices"][0]["message"]["reasoning_content"]), 9)
+        finally:
+            svc.set_shared(None)
+
     def test_streaming_across_the_cut(self):
         """One continuous SSE response: the thinking, then the answer, then the finish reason."""
         engine, svc = self.make([self.THINKING, self.ANSWER])
@@ -947,6 +965,46 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual("".join(delta(c, "content") for c in chunks), self.ANSWER)
         self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
         self.assertEqual(engine.turns, 2)
+
+
+class BudgetResolution(unittest.TestCase):
+    """The server's own thinking budget: `--reasoning-budget` (llama.cpp's flag) > the config's
+    `reasoning_budget_tokens` > $STRATA_REASONING_BUDGET, which argparse takes as the flag's default."""
+
+    def args(self, budget=None, message=""):
+        return SimpleNamespace(reasoning_budget=budget, reasoning_budget_message=message)
+
+    def test_flag_config_and_no_budget(self):
+        self.assertEqual(budget_from_args_and_config(self.args(500), {}), (500, BUDGET_MESSAGE))
+        self.assertEqual(budget_from_args_and_config(self.args(), {"reasoning_budget_tokens": 900}),
+                         (900, BUDGET_MESSAGE))
+        self.assertEqual(budget_from_args_and_config(self.args(), {}), (None, ""))
+        self.assertEqual(budget_from_args_and_config(self.args(0), {}), (0, BUDGET_MESSAGE))
+        self.assertEqual(budget_from_args_and_config(self.args(), {"reasoning_budget_tokens": None}), (None, ""))
+
+    def test_flag_wins_over_the_config(self):
+        self.assertEqual(budget_from_args_and_config(self.args(5, "wrap up"), {"reasoning_budget_tokens": 900}),
+                         (5, "wrap up"))
+        self.assertEqual(budget_from_args_and_config(self.args(), {"reasoning_budget_tokens": 900,
+                                                                   "reasoning_budget_message": "config msg"}),
+                         (900, "config msg"))
+
+    def test_a_negative_budget_means_no_cap(self):
+        self.assertEqual(budget_from_args_and_config(self.args(-1), {"reasoning_budget_tokens": 900}), (None, ""))
+
+    def test_a_bad_value_stops_the_start(self):
+        with self.assertRaises(SystemExit):
+            budget_from_args_and_config(self.args("lots"), {})
+
+    def test_env_int(self):
+        os.environ["STRATA_TEST_BUDGET"] = "8000"
+        try:
+            self.assertEqual(_env_int("STRATA_TEST_BUDGET"), 8000)
+            os.environ["STRATA_TEST_BUDGET"] = "eight thousand"
+            self.assertIsNone(_env_int("STRATA_TEST_BUDGET"))       # named and ignored, not a crash
+            self.assertIsNone(_env_int("STRATA_TEST_BUDGET_UNSET"))
+        finally:
+            os.environ.pop("STRATA_TEST_BUDGET", None)
 
 
 if __name__ == "__main__":
